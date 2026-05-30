@@ -298,17 +298,15 @@ def build_workbook(results: list[RoomResult]) -> bytes:
 # ── OneDrive (Microsoft Graph API) ───────────────────────
 
 def get_onedrive_token() -> str:
-    """Fetch a fresh access token using the stored refresh token (personal accounts)."""
     client_id     = os.environ["ONEDRIVE_CLIENT_ID"]
-    client_secret = os.environ["ONEDRIVE_CLIENT_SECRET"]
     refresh_token = os.environ["ONEDRIVE_REFRESH_TOKEN"]
+    tenant_id     = os.environ["ONEDRIVE_TENANT_ID"]
 
     resp = requests.post(
-        "https://login.microsoftonline.com/consumers/oauth2/v2.0/token",
+        f"https://login.microsoftonline.com/{tenant_id}/oauth2/v2.0/token",
         data={
             "grant_type":    "refresh_token",
             "client_id":     client_id,
-            "client_secret": client_secret,
             "refresh_token": refresh_token,
             "scope":         "Files.ReadWrite",
         },
