@@ -3,10 +3,11 @@
 Hotel Price Scraper — Google Sheets Edition
 --------------------------------------------
 Reads config from CONFIG_JSON secret.
-Scrapes Booking.com and appends results to a Google Sheet.
+Hotels can each have their own currency.
+Appends results to a Google Sheet daily.
 
 GitHub Secrets required:
-  CONFIG_JSON             - your hotels/dates config
+  CONFIG_JSON             - your hotels/dates config (see config.template.json)
   GOOGLE_SERVICE_ACCOUNT  - full contents of your service account JSON key file
   GOOGLE_SHEET_ID         - the ID from your Google Sheet URL
 """
@@ -39,11 +40,19 @@ def load_config() -> dict:
 
 
 CONFIG      = load_config()
-HOTELS      = CONFIG["hotels"]
 DATE_RANGES = [tuple(d) for d in CONFIG["date_ranges"]]
 ADULTS      = CONFIG.get("adults", 2)
 ROOMS       = CONFIG.get("rooms", 1)
-CURRENCY    = CONFIG.get("currency", "SGD")
+
+# Hotels is now a list of dicts: {"name": "...", "currency": "..."}
+# Support both old format (list of strings) and new format (list of dicts)
+raw_hotels = CONFIG["hotels"]
+if raw_hotels and isinstance(raw_hotels[0], str):
+    # Legacy format — all use same currency
+    default_currency = CONFIG.get("currency", "SGD")
+    HOTELS = [{"name": h, "currency": default_currency} for h in raw_hotels]
+else:
+    HOTELS = raw_hotels
 
 
 # ── Data model ────────────────────────────────────────────
@@ -70,7 +79,6 @@ HEADERS = [f.name.replace("_", " ").title() for f in fields(RoomResult)]
 # ── Google Sheets helpers ─────────────────────────────────
 
 def get_sheet():
-    """Authenticate and return the target worksheet."""
     sa_json  = os.environ.get("GOOGLE_SERVICE_ACCOUNT", "")
     sheet_id = os.environ.get("GOOGLE_SHEET_ID", "")
 
@@ -92,16 +100,13 @@ def get_sheet():
     client = gspread.authorize(creds)
     sheet  = client.open_by_key(sheet_id)
 
-    # Use first worksheet, or create it if missing
     try:
         ws = sheet.worksheet("Hotel Prices")
     except gspread.exceptions.WorksheetNotFound:
         ws = sheet.add_worksheet(title="Hotel Prices", rows=10000, cols=20)
 
-    # Add header row if sheet is empty
     if ws.row_count == 0 or not ws.row_values(1):
         ws.append_row(HEADERS, value_input_option="RAW")
-        # Bold the header row
         ws.format("1:1", {
             "textFormat": {"bold": True},
             "backgroundColor": {"red": 0.122, "green": 0.22, "blue": 0.392},
@@ -111,14 +116,12 @@ def get_sheet():
 
 
 def append_to_sheet(ws, results: list[RoomResult]) -> None:
-    """Append all result rows to the worksheet in one API call."""
     col_names = [f.name for f in fields(RoomResult)]
     rows = []
     for r in results:
         row = []
         for name in col_names:
             val = getattr(r, name)
-            # Store numeric columns as numbers
             if name in ("price_per_night", "total_price", "nights"):
                 try:
                     val = int(val)
@@ -150,13 +153,13 @@ async def dismiss_overlays(page) -> None:
             pass
 
 
-async def get_hotel_url(page, hotel: str, check_in: str, check_out: str) -> Optional[str]:
+async def get_hotel_url(page, hotel: str, check_in: str, check_out: str, currency: str) -> Optional[str]:
     q = hotel.replace(" ", "+")
     search_url = (
         f"https://www.booking.com/search.html?ss={q}"
         f"&checkin={check_in}&checkout={check_out}"
         f"&group_adults={ADULTS}&no_rooms={ROOMS}"
-        f"&selected_currency={CURRENCY}&lang=en-gb&order=popularity"
+        f"&selected_currency={currency}&lang=en-gb&order=popularity"
     )
     await page.goto(search_url, wait_until="domcontentloaded", timeout=35000)
     await page.wait_for_timeout(3500)
@@ -210,8 +213,8 @@ async def scrape_room_table(page) -> list[dict]:
         except ValueError:
             continue
 
-        row_text  = (await row.inner_text()).lower()
-        cond_el   = await row.query_selector(".hprt-conditions, [data-testid='cancellation-and-charges']")
+        row_text   = (await row.inner_text()).lower()
+        cond_el    = await row.query_selector(".hprt-conditions, [data-testid='cancellation-and-charges']")
         check_cond = (await cond_el.inner_text()).lower() if cond_el else row_text
 
         free_cancel = "Unknown"
@@ -239,14 +242,14 @@ async def scrape_room_table(page) -> list[dict]:
     return rooms
 
 
-async def fetch_hotel(page, hotel: str, check_in: str, check_out: str) -> Optional[RoomResult]:
+async def fetch_hotel(page, hotel_name: str, currency: str, check_in: str, check_out: str) -> Optional[RoomResult]:
     ci     = datetime.strptime(check_in, "%Y-%m-%d")
     co     = datetime.strptime(check_out, "%Y-%m-%d")
     nights = (co - ci).days
 
-    print(f"  🔍  {hotel}  |  {check_in} → {check_out}")
+    print(f"  🔍  {hotel_name}  |  {check_in} → {check_out}  |  {currency}")
     try:
-        hotel_url = await get_hotel_url(page, hotel, check_in, check_out)
+        hotel_url = await get_hotel_url(page, hotel_name, check_in, check_out, currency)
         if not hotel_url:
             print(f"    ⚠️  No search result found")
             return None
@@ -254,7 +257,7 @@ async def fetch_hotel(page, hotel: str, check_in: str, check_out: str) -> Option
         direct_url = (
             f"{hotel_url}?checkin={check_in}&checkout={check_out}"
             f"&group_adults={ADULTS}&no_rooms={ROOMS}"
-            f"&selected_currency={CURRENCY}&lang=en-gb"
+            f"&selected_currency={currency}&lang=en-gb"
         )
         await page.goto(direct_url, wait_until="domcontentloaded", timeout=35000)
         await page.wait_for_timeout(3500)
@@ -269,17 +272,17 @@ async def fetch_hotel(page, hotel: str, check_in: str, check_out: str) -> Option
         total     = cheapest["total_val"]
         per_night = round(total / nights, 0)
 
-        print(f"    ✅  {cheapest['room_type'][:40]}  |  {CURRENCY} {per_night:.0f}/night")
+        print(f"    ✅  {cheapest['room_type'][:40]}  |  {currency} {per_night:.0f}/night")
         return RoomResult(
             scraped_date       = date.today().isoformat(),
-            hotel              = hotel,
+            hotel              = hotel_name,
             check_in           = check_in,
             check_out          = check_out,
             nights             = nights,
             room_type          = cheapest["room_type"],
             price_per_night    = f"{per_night:.0f}",
             total_price        = f"{total:.0f}",
-            currency           = CURRENCY,
+            currency           = currency,
             free_cancellation  = cheapest["free_cancellation"],
             breakfast_included = cheapest["breakfast"],
             url                = direct_url,
@@ -298,9 +301,9 @@ async def main():
         print("playwright not installed.")
         sys.exit(1)
 
+    total_combos = len(HOTELS) * len(DATE_RANGES)
     print(f"\n🏨  Hotel Price Scraper — {date.today()}")
-    print(f"    {len(HOTELS)} hotels × {len(DATE_RANGES)} date ranges = "
-          f"{len(HOTELS) * len(DATE_RANGES)} combinations\n")
+    print(f"    {len(HOTELS)} hotels × {len(DATE_RANGES)} date ranges = {total_combos} combinations\n")
 
     results: list[RoomResult] = []
 
@@ -319,8 +322,10 @@ async def main():
         page = await context.new_page()
 
         for hotel in HOTELS:
+            hotel_name = hotel["name"]
+            currency   = hotel["currency"]
             for check_in, check_out in DATE_RANGES:
-                result = await fetch_hotel(page, hotel, check_in, check_out)
+                result = await fetch_hotel(page, hotel_name, currency, check_in, check_out)
                 if result:
                     results.append(result)
                 await asyncio.sleep(2)
