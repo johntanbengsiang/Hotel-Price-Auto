@@ -328,7 +328,7 @@ async def main():
                 result = await fetch_hotel(page, hotel_name, currency, check_in, check_out)
                 if result:
                     results.append(result)
-                await asyncio.sleep(2)
+                await asyncio.sleep(4)
 
         await browser.close()
 
