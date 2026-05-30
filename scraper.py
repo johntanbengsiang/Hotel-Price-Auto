@@ -1,41 +1,35 @@
 #!/usr/bin/env python3
 """
-Hotel Price Scraper
--------------------
-Reads configuration from the CONFIG_JSON environment variable (set via GitHub Secret).
-Scrapes Booking.com for the cheapest available room per hotel/date combination.
-Appends results to hotel_prices.xlsx and uploads it to OneDrive.
+Hotel Price Scraper — Google Sheets Edition
+--------------------------------------------
+Reads config from CONFIG_JSON secret.
+Scrapes Booking.com and appends results to a Google Sheet.
 
-Environment variables required (all set as GitHub Secrets):
-  CONFIG_JSON          - JSON string with hotels, dates, adults, rooms, currency
-  ONEDRIVE_TOKEN       - Microsoft Graph API access token (refreshed each run)
-  ONEDRIVE_CLIENT_ID   - Azure App client ID
-  ONEDRIVE_CLIENT_SECRET - Azure App client secret
-  ONEDRIVE_TENANT_ID   - Azure tenant ID (use "consumers" for personal OneDrive)
-  ONEDRIVE_FOLDER      - Target folder path in OneDrive e.g. "Hotel Tracker"
+GitHub Secrets required:
+  CONFIG_JSON             - your hotels/dates config
+  GOOGLE_SERVICE_ACCOUNT  - full contents of your service account JSON key file
+  GOOGLE_SHEET_ID         - the ID from your Google Sheet URL
 """
 
 import asyncio
-import io
 import json
 import os
 import re
 import sys
 from dataclasses import dataclass, fields
 from datetime import date, datetime
-from pathlib import Path
 from typing import Optional
 
-import requests
+import gspread
+from google.oauth2.service_account import Credentials
 
 
-# ── Load config from environment ─────────────────────────
+# ── Load config ───────────────────────────────────────────
 
 def load_config() -> dict:
     raw = os.environ.get("CONFIG_JSON", "").strip()
     if not raw:
         print("❌  CONFIG_JSON environment variable is not set.")
-        print("    Set it as a GitHub Secret containing your config.json contents.")
         sys.exit(1)
     try:
         return json.loads(raw)
@@ -44,13 +38,12 @@ def load_config() -> dict:
         sys.exit(1)
 
 
-CONFIG       = load_config()
-HOTELS       = CONFIG["hotels"]
-DATE_RANGES  = [tuple(d) for d in CONFIG["date_ranges"]]
-ADULTS       = CONFIG.get("adults", 2)
-ROOMS        = CONFIG.get("rooms", 1)
-CURRENCY     = CONFIG.get("currency", "SGD")
-OUTPUT_FILE  = Path("hotel_prices.xlsx")
+CONFIG      = load_config()
+HOTELS      = CONFIG["hotels"]
+DATE_RANGES = [tuple(d) for d in CONFIG["date_ranges"]]
+ADULTS      = CONFIG.get("adults", 2)
+ROOMS       = CONFIG.get("rooms", 1)
+CURRENCY    = CONFIG.get("currency", "SGD")
 
 
 # ── Data model ────────────────────────────────────────────
@@ -69,6 +62,73 @@ class RoomResult:
     free_cancellation:  str
     breakfast_included: str
     url:                str
+
+
+HEADERS = [f.name.replace("_", " ").title() for f in fields(RoomResult)]
+
+
+# ── Google Sheets helpers ─────────────────────────────────
+
+def get_sheet():
+    """Authenticate and return the target worksheet."""
+    sa_json  = os.environ.get("GOOGLE_SERVICE_ACCOUNT", "")
+    sheet_id = os.environ.get("GOOGLE_SHEET_ID", "")
+
+    if not sa_json:
+        print("❌  GOOGLE_SERVICE_ACCOUNT secret is not set.")
+        sys.exit(1)
+    if not sheet_id:
+        print("❌  GOOGLE_SHEET_ID secret is not set.")
+        sys.exit(1)
+
+    sa_dict = json.loads(sa_json)
+    creds   = Credentials.from_service_account_info(
+        sa_dict,
+        scopes=[
+            "https://www.googleapis.com/auth/spreadsheets",
+            "https://www.googleapis.com/auth/drive",
+        ],
+    )
+    client = gspread.authorize(creds)
+    sheet  = client.open_by_key(sheet_id)
+
+    # Use first worksheet, or create it if missing
+    try:
+        ws = sheet.worksheet("Hotel Prices")
+    except gspread.exceptions.WorksheetNotFound:
+        ws = sheet.add_worksheet(title="Hotel Prices", rows=10000, cols=20)
+
+    # Add header row if sheet is empty
+    if ws.row_count == 0 or not ws.row_values(1):
+        ws.append_row(HEADERS, value_input_option="RAW")
+        # Bold the header row
+        ws.format("1:1", {
+            "textFormat": {"bold": True},
+            "backgroundColor": {"red": 0.122, "green": 0.22, "blue": 0.392},
+        })
+
+    return ws
+
+
+def append_to_sheet(ws, results: list[RoomResult]) -> None:
+    """Append all result rows to the worksheet in one API call."""
+    col_names = [f.name for f in fields(RoomResult)]
+    rows = []
+    for r in results:
+        row = []
+        for name in col_names:
+            val = getattr(r, name)
+            # Store numeric columns as numbers
+            if name in ("price_per_night", "total_price", "nights"):
+                try:
+                    val = int(val)
+                except (ValueError, TypeError):
+                    pass
+            row.append(val)
+        rows.append(row)
+
+    ws.append_rows(rows, value_input_option="USER_ENTERED")
+    print(f"  📊  Appended {len(rows)} rows to Google Sheet")
 
 
 # ── Playwright helpers ────────────────────────────────────
@@ -150,8 +210,8 @@ async def scrape_room_table(page) -> list[dict]:
         except ValueError:
             continue
 
-        row_text = (await row.inner_text()).lower()
-        cond_el = await row.query_selector(".hprt-conditions, [data-testid='cancellation-and-charges']")
+        row_text  = (await row.inner_text()).lower()
+        cond_el   = await row.query_selector(".hprt-conditions, [data-testid='cancellation-and-charges']")
         check_cond = (await cond_el.inner_text()).lower() if cond_el else row_text
 
         free_cancel = "Unknown"
@@ -180,8 +240,8 @@ async def scrape_room_table(page) -> list[dict]:
 
 
 async def fetch_hotel(page, hotel: str, check_in: str, check_out: str) -> Optional[RoomResult]:
-    ci = datetime.strptime(check_in, "%Y-%m-%d")
-    co = datetime.strptime(check_out, "%Y-%m-%d")
+    ci     = datetime.strptime(check_in, "%Y-%m-%d")
+    co     = datetime.strptime(check_out, "%Y-%m-%d")
     nights = (co - ci).days
 
     print(f"  🔍  {hotel}  |  {check_in} → {check_out}")
@@ -229,136 +289,6 @@ async def fetch_hotel(page, hotel: str, check_in: str, check_out: str) -> Option
         return None
 
 
-# ── Excel helpers ─────────────────────────────────────────
-
-def build_workbook(results: list[RoomResult]) -> bytes:
-    """
-    Download existing workbook from OneDrive (if it exists), append new rows,
-    and return the updated workbook as bytes.
-    """
-    from openpyxl import Workbook, load_workbook
-    from openpyxl.styles import Font, PatternFill, Alignment
-    from openpyxl.utils import get_column_letter
-
-    col_names = [f.name for f in fields(RoomResult)]
-
-    # Try to fetch existing file from OneDrive
-    existing_bytes = download_from_onedrive()
-    if existing_bytes:
-        wb = load_workbook(io.BytesIO(existing_bytes))
-        ws = wb.active
-    else:
-        # First run — create fresh workbook with styled header
-        wb = Workbook()
-        ws = wb.active
-        ws.title = "Hotel Prices"
-
-        header_fill = PatternFill("solid", fgColor="1F3864")
-        header_font = Font(bold=True, color="FFFFFF", size=11)
-        widths = {
-            "scraped_date": 14, "hotel": 30, "check_in": 12, "check_out": 12,
-            "nights": 8, "room_type": 32, "price_per_night": 14,
-            "total_price": 12, "currency": 10, "free_cancellation": 18,
-            "breakfast_included": 18, "url": 55,
-        }
-        for col, name in enumerate(col_names, 1):
-            cell = ws.cell(row=1, column=col,
-                           value=name.replace("_", " ").title())
-            cell.fill = header_fill
-            cell.font = header_font
-            cell.alignment = Alignment(horizontal="center")
-            ws.column_dimensions[get_column_letter(col)].width = widths.get(name, 15)
-
-    # Append new rows
-    next_row = ws.max_row + 1
-    stripe_a = PatternFill("solid", fgColor="EBF0FA")
-    stripe_b = PatternFill("solid", fgColor="FFFFFF")
-
-    for i, r in enumerate(results):
-        fill = stripe_a if (next_row + i) % 2 == 0 else stripe_b
-        for col, name in enumerate(col_names, 1):
-            val = getattr(r, name)
-            if name in ("price_per_night", "total_price", "nights"):
-                try:
-                    val = int(val) if "." not in str(val) else float(val)
-                except (ValueError, TypeError):
-                    pass
-            cell = ws.cell(row=next_row + i, column=col, value=val)
-            cell.fill = fill
-            cell.alignment = Alignment(
-                horizontal="left" if col == 2 else "center"
-            )
-
-    buf = io.BytesIO()
-    wb.save(buf)
-    buf.seek(0)
-    return buf.read()
-
-
-# ── OneDrive (Microsoft Graph API) ───────────────────────
-
-def get_onedrive_token() -> str:
-    client_id     = os.environ["ONEDRIVE_CLIENT_ID"]
-    refresh_token = os.environ["ONEDRIVE_REFRESH_TOKEN"]
-    tenant_id     = os.environ["ONEDRIVE_TENANT_ID"]
-
-    resp = requests.post(
-        f"https://login.microsoftonline.com/{tenant_id}/oauth2/v2.0/token",
-        data={
-            "grant_type":    "refresh_token",
-            "client_id":     client_id,
-            "refresh_token": refresh_token,
-            "scope":         "Files.ReadWrite",
-        },
-        timeout=30,
-    )
-    resp.raise_for_status()
-    return resp.json()["access_token"]
-
-
-def _graph_headers(token: str) -> dict:
-    return {"Authorization": f"Bearer {token}",
-            "Content-Type": "application/octet-stream"}
-
-
-def download_from_onedrive() -> Optional[bytes]:
-    """Return existing hotel_prices.xlsx bytes from OneDrive, or None if not found."""
-    try:
-        token  = get_onedrive_token()
-        folder = os.environ.get("ONEDRIVE_FOLDER", "Hotel Tracker")
-        path   = f"{folder}/hotel_prices.xlsx"
-        url    = f"https://graph.microsoft.com/v1.0/me/drive/root:/{path}:/content"
-        resp   = requests.get(url, headers={"Authorization": f"Bearer {token}"}, timeout=30)
-        if resp.status_code == 200:
-            print("  📥  Downloaded existing workbook from OneDrive")
-            return resp.content
-        elif resp.status_code == 404:
-            print("  📄  No existing workbook found — creating fresh one")
-            return None
-        else:
-            print(f"  ⚠️  OneDrive download returned {resp.status_code}, starting fresh")
-            return None
-    except Exception as e:
-        print(f"  ⚠️  Could not download from OneDrive: {e}")
-        return None
-
-
-def upload_to_onedrive(file_bytes: bytes) -> None:
-    """Upload hotel_prices.xlsx bytes to OneDrive, overwriting any existing file."""
-    token  = get_onedrive_token()
-    folder = os.environ.get("ONEDRIVE_FOLDER", "Hotel Tracker")
-    path   = f"{folder}/hotel_prices.xlsx"
-    url    = f"https://graph.microsoft.com/v1.0/me/drive/root:/{path}:/content"
-
-    resp = requests.put(url, headers=_graph_headers(token),
-                        data=file_bytes, timeout=60)
-    if resp.status_code in (200, 201):
-        print(f"  ☁️   Uploaded hotel_prices.xlsx → OneDrive/{folder}/")
-    else:
-        print(f"  ❌  OneDrive upload failed: {resp.status_code} {resp.text[:200]}")
-        sys.exit(1)
-
-
 # ── Main ──────────────────────────────────────────────────
 
 async def main():
@@ -398,13 +328,13 @@ async def main():
         await browser.close()
 
     if not results:
-        print("\n⚠️  No results scraped — skipping upload.")
+        print("\n⚠️  No results scraped.")
         sys.exit(0)
 
-    print(f"\n💾  Building workbook with {len(results)} new rows…")
-    file_bytes = build_workbook(results)
-    upload_to_onedrive(file_bytes)
-    print(f"\n✅  Done. {len(results)} rows written.")
+    print(f"\n💾  Writing {len(results)} rows to Google Sheets…")
+    ws = get_sheet()
+    append_to_sheet(ws, results)
+    print(f"\n✅  Done.")
 
 
 if __name__ == "__main__":
