@@ -1,0 +1,14 @@
+# NEVER commit your actual config — use GitHub Secrets instead
+config.json
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.env
+
+# Local Excel output (lives in OneDrive, not the repo)
+hotel_prices.xlsx
+
+# Playwright debug screenshots
+*.png

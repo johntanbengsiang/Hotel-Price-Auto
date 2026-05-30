@@ -1,0 +1,17 @@
+{
+  "hotels": [
+    "Marina Bay Sands Singapore",
+    "Raffles Hotel Singapore",
+    "Capella Singapore",
+    "Four Seasons Hotel Singapore",
+    "The St. Regis Singapore"
+  ],
+  "date_ranges": [
+    ["2025-08-01", "2025-08-03"],
+    ["2025-09-12", "2025-09-14"],
+    ["2025-12-20", "2025-12-23"]
+  ],
+  "adults": 2,
+  "rooms": 1,
+  "currency": "SGD"
+}
