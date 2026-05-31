@@ -2,21 +2,16 @@
 """
 Hotel Price Scraper — Google Sheets Config Edition
 ----------------------------------------------------
-Configuration (hotels, compsets, dates) is read directly from a
-"Config" tab in your master Google Sheet — no JSON secrets to manage.
-
-Sheet structure expected:
-  Tab "Config - Hotels":
-    Columns: group_id | sheet_tab | hotel_name | currency | is_primary
-  Tab "Config - Dates":
-    Columns: check_in | check_out
+Reads config from "Config - Hotels" and "Config - Dates" tabs.
+Writes results to:
+  1. The group's own tab (e.g. "La Clef Group")
+  2. A shared "All Data" tab — single source for Looker Studio
 
 Usage: python scraper.py <group_id>
 
-GitHub Secrets required (only 3, never need changing):
+GitHub Secrets required:
   GOOGLE_SERVICE_ACCOUNT  - service account JSON key
   GOOGLE_SHEET_ID         - master Google Sheet ID
-  GROUP_ID                - injected by matrix workflow automatically
 """
 
 import asyncio
@@ -31,6 +26,7 @@ from typing import Optional
 import gspread
 from google.oauth2.service_account import Credentials
 
+ALL_DATA_TAB = "All Data"   # single consolidated tab for Looker Studio
 
 # ── Args ──────────────────────────────────────────────────
 
@@ -43,7 +39,7 @@ GROUP_ID = sys.argv[1]
 
 # ── Google Sheets client ──────────────────────────────────
 
-def get_gspread_client():
+def get_spreadsheet():
     sa_json  = os.environ.get("GOOGLE_SERVICE_ACCOUNT", "")
     sheet_id = os.environ.get("GOOGLE_SHEET_ID", "")
     if not sa_json:
@@ -52,7 +48,6 @@ def get_gspread_client():
     if not sheet_id:
         print("❌  GOOGLE_SHEET_ID not set.")
         sys.exit(1)
-
     creds = Credentials.from_service_account_info(
         json.loads(sa_json),
         scopes=[
@@ -60,22 +55,16 @@ def get_gspread_client():
             "https://www.googleapis.com/auth/drive",
         ],
     )
-    client      = gspread.authorize(creds)
-    spreadsheet = client.open_by_key(sheet_id)
-    return client, spreadsheet
+    return gspread.authorize(creds).open_by_key(sheet_id)
 
 
 # ── Load config from sheet ────────────────────────────────
 
-def load_config_from_sheet(spreadsheet):
-    """Read hotels and dates from the Config tabs in the master sheet."""
-
-    # ── Hotels ────────────────────────────────────────────
+def load_config(spreadsheet):
     try:
         hotels_ws = spreadsheet.worksheet("Config - Hotels")
     except gspread.exceptions.WorksheetNotFound:
-        print("❌  'Config - Hotels' tab not found in sheet.")
-        print("    Create it with columns: group_id | sheet_tab | hotel_name | currency | is_primary")
+        print("❌  'Config - Hotels' tab not found.")
         sys.exit(1)
 
     hotels_data = hotels_ws.get_all_records()
@@ -83,49 +72,41 @@ def load_config_from_sheet(spreadsheet):
         print("❌  'Config - Hotels' tab is empty.")
         sys.exit(1)
 
-    # Filter to only this group's hotels
-    group_hotels = [
-        row for row in hotels_data
-        if str(row.get("group_id", "")).strip().lower() == GROUP_ID.lower()
-        and str(row.get("hotel_name", "")).strip()
+    group_rows = [
+        r for r in hotels_data
+        if str(r.get("group_id", "")).strip().lower() == GROUP_ID.lower()
+        and str(r.get("hotel_name", "")).strip()
     ]
-    if not group_hotels:
-        print(f"❌  No hotels found for group '{GROUP_ID}' in Config - Hotels tab.")
-        print(f"    Available groups: {list(set(r['group_id'] for r in hotels_data))}")
+    if not group_rows:
+        available = list({r["group_id"] for r in hotels_data})
+        print(f"❌  Group '{GROUP_ID}' not found. Available: {available}")
         sys.exit(1)
 
-    # Get sheet tab name for this group (from first matching row)
-    sheet_tab = group_hotels[0].get("sheet_tab", GROUP_ID).strip()
-
+    sheet_tab = group_rows[0].get("sheet_tab", GROUP_ID).strip()
     hotels = [
         {
-            "name":       str(row["hotel_name"]).strip(),
-            "currency":   str(row.get("currency", "SGD")).strip().upper(),
-            "is_primary": str(row.get("is_primary", "")).strip().lower() in ("yes", "true", "1", "primary"),
+            "name":       str(r["hotel_name"]).strip(),
+            "currency":   str(r.get("currency", "SGD")).strip().upper(),
+            "is_primary": str(r.get("is_primary", "")).strip().lower()
+                          in ("yes", "true", "1", "primary"),
         }
-        for row in group_hotels
+        for r in group_rows
     ]
 
-    # ── Dates ─────────────────────────────────────────────
     try:
         dates_ws = spreadsheet.worksheet("Config - Dates")
     except gspread.exceptions.WorksheetNotFound:
-        print("❌  'Config - Dates' tab not found in sheet.")
-        print("    Create it with columns: check_in | check_out")
+        print("❌  'Config - Dates' tab not found.")
         sys.exit(1)
 
     dates_data = dates_ws.get_all_records()
-    if not dates_data:
-        print("❌  'Config - Dates' tab is empty.")
-        sys.exit(1)
-
     date_ranges = [
-        (str(row["check_in"]).strip(), str(row["check_out"]).strip())
-        for row in dates_data
-        if str(row.get("check_in", "")).strip() and str(row.get("check_out", "")).strip()
+        (str(r["check_in"]).strip(), str(r["check_out"]).strip())
+        for r in dates_data
+        if str(r.get("check_in", "")).strip() and str(r.get("check_out", "")).strip()
     ]
 
-    print(f"  📋  Loaded {len(hotels)} hotels and {len(date_ranges)} date ranges from sheet")
+    print(f"  📋  {len(hotels)} hotels · {len(date_ranges)} dates loaded from sheet")
     return hotels, date_ranges, sheet_tab
 
 
@@ -155,37 +136,33 @@ HEADERS = [f.name.replace("_", " ").title() for f in fields(RoomResult)]
 
 def classify_day_type(check_in: str) -> str:
     d = datetime.strptime(check_in, "%Y-%m-%d")
-    if d.weekday() == 4:
-        return "Shoulder (Fri-Sat)"
-    elif d.weekday() == 5:
-        return "Weekend (Sat-Sun)"
-    else:
-        return "Weekday (Tue-Wed)"
+    if d.weekday() == 4: return "Shoulder (Fri-Sat)"
+    if d.weekday() == 5: return "Weekend (Sat-Sun)"
+    return "Weekday (Tue-Wed)"
 
 
-# ── Output sheet helpers ──────────────────────────────────
+# ── Sheet write helpers ───────────────────────────────────
 
-def get_or_create_output_tab(spreadsheet, sheet_tab: str):
+def get_or_create_tab(spreadsheet, tab_name: str):
     try:
-        ws = spreadsheet.worksheet(sheet_tab)
+        ws = spreadsheet.worksheet(tab_name)
     except gspread.exceptions.WorksheetNotFound:
-        ws = spreadsheet.add_worksheet(title=sheet_tab, rows=50000, cols=20)
+        ws = spreadsheet.add_worksheet(title=tab_name, rows=100000, cols=20)
 
-    existing = ws.row_values(1) if ws.row_count > 0 else []
-    if not existing:
+    if not ws.row_values(1):
         ws.append_row(HEADERS, value_input_option="RAW")
         ws.format("1:1", {
             "textFormat": {
                 "bold": True,
-                "foregroundColor": {"red": 1, "green": 1, "blue": 1}
+                "foregroundColor": {"red": 1, "green": 1, "blue": 1},
             },
             "backgroundColor": {"red": 0.122, "green": 0.22, "blue": 0.392},
         })
-        print(f"  📋  Created output tab: '{sheet_tab}'")
+        print(f"  📋  Created tab: '{tab_name}'")
     return ws
 
 
-def append_to_sheet(ws, results: list[RoomResult], sheet_tab: str) -> None:
+def results_to_rows(results: list[RoomResult]) -> list[list]:
     col_names = [f.name for f in fields(RoomResult)]
     rows = []
     for r in results:
@@ -199,11 +176,24 @@ def append_to_sheet(ws, results: list[RoomResult], sheet_tab: str) -> None:
                     pass
             row.append(val)
         rows.append(row)
-    ws.append_rows(rows, value_input_option="USER_ENTERED")
-    print(f"  📊  Appended {len(rows)} rows → '{sheet_tab}'")
+    return rows
 
 
-# ── Playwright ────────────────────────────────────────────
+def append_results(spreadsheet, results: list[RoomResult], group_tab: str) -> None:
+    rows = results_to_rows(results)
+
+    # 1. Write to group tab
+    ws_group = get_or_create_tab(spreadsheet, group_tab)
+    ws_group.append_rows(rows, value_input_option="USER_ENTERED")
+    print(f"  📊  {len(rows)} rows → '{group_tab}'")
+
+    # 2. Write to All Data tab
+    ws_all = get_or_create_tab(spreadsheet, ALL_DATA_TAB)
+    ws_all.append_rows(rows, value_input_option="USER_ENTERED")
+    print(f"  📊  {len(rows)} rows → '{ALL_DATA_TAB}'")
+
+
+# ── Playwright helpers ────────────────────────────────────
 
 async def dismiss_overlays(page) -> None:
     for sel in [
@@ -222,10 +212,7 @@ async def dismiss_overlays(page) -> None:
             pass
 
 
-async def get_hotel_url(
-    page, hotel: str, check_in: str, check_out: str,
-    currency: str, adults: int, rooms: int
-) -> Optional[str]:
+async def get_hotel_url(page, hotel, check_in, check_out, currency, adults, rooms):
     q = hotel.replace(" ", "+")
     url = (
         f"https://www.booking.com/search.html?ss={q}"
@@ -315,11 +302,8 @@ async def scrape_room_table(page) -> list[dict]:
     return rooms
 
 
-async def fetch_hotel(
-    page, hotel_name: str, currency: str, is_primary: bool,
-    check_in: str, check_out: str, sheet_tab: str,
-    adults: int, rooms: int
-) -> Optional[RoomResult]:
+async def fetch_hotel(page, hotel_name, currency, is_primary,
+                      check_in, check_out, sheet_tab, adults, rooms):
     ci     = datetime.strptime(check_in, "%Y-%m-%d")
     co     = datetime.strptime(check_out, "%Y-%m-%d")
     nights = (co - ci).days
@@ -386,14 +370,12 @@ async def main():
 
     print(f"\n🏨  Hotel Price Scraper — {date.today()}  |  Group: {GROUP_ID}")
 
-    # Load config from Google Sheet
-    _, spreadsheet = get_gspread_client()
-    hotels, date_ranges, sheet_tab = load_config_from_sheet(spreadsheet)
+    spreadsheet = get_spreadsheet()
+    hotels, date_ranges, sheet_tab = load_config(spreadsheet)
 
-    adults = 2   # hardcoded defaults — change here if needed
+    adults = 2
     rooms  = 1
-
-    total = len(hotels) * len(date_ranges)
+    total  = len(hotels) * len(date_ranges)
     print(f"    {len(hotels)} hotels × {len(date_ranges)} dates = {total} combinations\n")
 
     results: list[RoomResult] = []
@@ -435,9 +417,8 @@ async def main():
         print("\n⚠️  No results scraped.")
         sys.exit(0)
 
-    print(f"\n💾  Writing {len(results)} rows to Google Sheets…")
-    ws = get_or_create_output_tab(spreadsheet, sheet_tab)
-    append_to_sheet(ws, results, sheet_tab)
+    print(f"\n💾  Writing {len(results)} rows…")
+    append_results(spreadsheet, results, sheet_tab)
     print(f"✅  Group '{GROUP_ID}' done.")
 
 
