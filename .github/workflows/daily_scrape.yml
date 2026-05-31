@@ -12,6 +12,17 @@ jobs:
     permissions:
       contents: read
 
+    strategy:
+      fail-fast: false        # if one group fails, others keep running
+      matrix:
+        group_id:
+          - la_clef
+          - islington
+          - canal
+          - gambetta
+          - walker
+          - bondi
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -33,9 +44,9 @@ jobs:
       - name: Install Playwright Chromium
         run: playwright install chromium --with-deps
 
-      - name: Run scraper
+      - name: Run scraper for ${{ matrix.group_id }}
         env:
           CONFIG_JSON:            ${{ secrets.CONFIG_JSON }}
           GOOGLE_SERVICE_ACCOUNT: ${{ secrets.GOOGLE_SERVICE_ACCOUNT }}
           GOOGLE_SHEET_ID:        ${{ secrets.GOOGLE_SHEET_ID }}
-        run: python scraper.py
+        run: python scraper.py ${{ matrix.group_id }}
