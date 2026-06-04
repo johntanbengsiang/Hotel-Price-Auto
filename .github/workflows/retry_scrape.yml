@@ -1,0 +1,44 @@
+name: Retry Failed Scrapes
+
+on:
+  schedule:
+    # Runs 4 hours after the main scraper (main: 00:00 UTC / 08:00 SGT)
+    # This runs at 04:00 UTC / 12:00 SGT
+    # Adjust if you change the main scraper schedule
+    - cron: "0 4 * * *"
+
+  # Also triggerable manually from the Actions tab
+  workflow_dispatch:
+
+jobs:
+  retry:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Cache pip packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-${{ hashFiles('requirements.txt') }}
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Install Playwright Chromium
+        run: playwright install chromium --with-deps
+
+      - name: Run retry scraper
+        env:
+          GOOGLE_SERVICE_ACCOUNT: ${{ secrets.GOOGLE_SERVICE_ACCOUNT }}
+          GOOGLE_SHEET_ID:        ${{ secrets.GOOGLE_SHEET_ID }}
+        run: python retry_scraper.py
