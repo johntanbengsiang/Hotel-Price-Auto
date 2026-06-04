@@ -5,7 +5,8 @@ Hotel Price Scraper — Google Sheets Config Edition
 Reads config from "Config - Hotels" and "Config - Dates" tabs.
 Writes results to:
   1. The group's own tab (e.g. "La Clef Group")
-  2. A shared "All Data" tab — single source for Looker Studio
+  2. "All Data" tab — single source for Looker Studio
+  3. "Scrape Failures" tab — logs every hotel/date that returned no price
 
 Usage: python scraper.py <group_id>
 
@@ -26,7 +27,8 @@ from typing import Optional
 import gspread
 from google.oauth2.service_account import Credentials
 
-ALL_DATA_TAB = "All Data"   # single consolidated tab for Looker Studio
+ALL_DATA_TAB  = "All Data"
+FAILURE_TAB   = "Scrape Failures"
 
 # ── Args ──────────────────────────────────────────────────
 
@@ -110,7 +112,7 @@ def load_config(spreadsheet):
     return hotels, date_ranges, sheet_tab
 
 
-# ── Data model ────────────────────────────────────────────
+# ── Data models ───────────────────────────────────────────
 
 @dataclass
 class RoomResult:
@@ -131,7 +133,21 @@ class RoomResult:
     url:                str
 
 
-HEADERS = [f.name.replace("_", " ").title() for f in fields(RoomResult)]
+@dataclass
+class FailureLog:
+    logged_date:  str   # date this failure was recorded
+    group:        str
+    is_primary:   str
+    hotel:        str
+    check_in:     str
+    check_out:    str
+    day_type:     str
+    reason:       str   # "No search result" | "Room table empty" | "Exception: ..."
+    search_url:   str
+
+
+RESULT_HEADERS  = [f.name.replace("_", " ").title() for f in fields(RoomResult)]
+FAILURE_HEADERS = [f.name.replace("_", " ").title() for f in fields(FailureLog)]
 
 
 def classify_day_type(check_in: str) -> str:
@@ -143,14 +159,14 @@ def classify_day_type(check_in: str) -> str:
 
 # ── Sheet write helpers ───────────────────────────────────
 
-def get_or_create_tab(spreadsheet, tab_name: str):
+def get_or_create_tab(spreadsheet, tab_name: str, headers: list[str]):
     try:
         ws = spreadsheet.worksheet(tab_name)
     except gspread.exceptions.WorksheetNotFound:
-        ws = spreadsheet.add_worksheet(title=tab_name, rows=100000, cols=20)
+        ws = spreadsheet.add_worksheet(title=tab_name, rows=100000, cols=25)
 
     if not ws.row_values(1):
-        ws.append_row(HEADERS, value_input_option="RAW")
+        ws.append_row(headers, value_input_option="RAW")
         ws.format("1:1", {
             "textFormat": {
                 "bold": True,
@@ -179,18 +195,41 @@ def results_to_rows(results: list[RoomResult]) -> list[list]:
     return rows
 
 
-def append_results(spreadsheet, results: list[RoomResult], group_tab: str) -> None:
-    rows = results_to_rows(results)
+def failures_to_rows(failures: list[FailureLog]) -> list[list]:
+    col_names = [f.name for f in fields(FailureLog)]
+    return [[getattr(f, n) for n in col_names] for f in failures]
 
-    # 1. Write to group tab
-    ws_group = get_or_create_tab(spreadsheet, group_tab)
-    ws_group.append_rows(rows, value_input_option="USER_ENTERED")
-    print(f"  📊  {len(rows)} rows → '{group_tab}'")
 
-    # 2. Write to All Data tab
-    ws_all = get_or_create_tab(spreadsheet, ALL_DATA_TAB)
-    ws_all.append_rows(rows, value_input_option="USER_ENTERED")
-    print(f"  📊  {len(rows)} rows → '{ALL_DATA_TAB}'")
+def append_results(spreadsheet, results: list[RoomResult],
+                   failures: list[FailureLog], group_tab: str) -> None:
+    # 1. Group tab
+    if results:
+        ws_group = get_or_create_tab(spreadsheet, group_tab, RESULT_HEADERS)
+        ws_group.append_rows(results_to_rows(results), value_input_option="USER_ENTERED")
+        print(f"  📊  {len(results)} rows → '{group_tab}'")
+
+    # 2. All Data tab
+    if results:
+        ws_all = get_or_create_tab(spreadsheet, ALL_DATA_TAB, RESULT_HEADERS)
+        ws_all.append_rows(results_to_rows(results), value_input_option="USER_ENTERED")
+        print(f"  📊  {len(results)} rows → '{ALL_DATA_TAB}'")
+
+    # 3. Scrape Failures tab
+    if failures:
+        ws_fail = get_or_create_tab(spreadsheet, FAILURE_TAB, FAILURE_HEADERS)
+        # Style failure header red instead of navy
+        if ws_fail.row_values(1) == FAILURE_HEADERS:
+            ws_fail.format("1:1", {
+                "textFormat": {
+                    "bold": True,
+                    "foregroundColor": {"red": 1, "green": 1, "blue": 1},
+                },
+                "backgroundColor": {"red": 0.75, "green": 0.15, "blue": 0.15},
+            })
+        ws_fail.append_rows(failures_to_rows(failures), value_input_option="USER_ENTERED")
+        print(f"  ⚠️   {len(failures)} failures → '{FAILURE_TAB}'")
+    else:
+        print(f"  ✅  No failures for this group")
 
 
 # ── Playwright helpers ────────────────────────────────────
@@ -228,14 +267,14 @@ async def get_hotel_url(page, hotel, check_in, check_out, currency, adults, room
     try:
         await card.wait_for(timeout=8000)
     except Exception:
-        return None
+        return None, url   # return search url for failure log
 
     href = await card.locator('[data-testid="title-link"]').first.get_attribute("href")
     if not href:
-        return None
+        return None, url
     if not href.startswith("http"):
         href = "https://www.booking.com" + href
-    return href.split("?")[0]
+    return href.split("?")[0], url
 
 
 async def scrape_room_table(page) -> list[dict]:
@@ -308,15 +347,30 @@ async def fetch_hotel(page, hotel_name, currency, is_primary,
     co     = datetime.strptime(check_out, "%Y-%m-%d")
     nights = (co - ci).days
     label  = "PRIMARY" if is_primary else "compset"
+    day_type = classify_day_type(check_in)
+    primary_str = "Primary" if is_primary else "Compset"
+
+    def make_failure(reason: str, search_url: str = "") -> FailureLog:
+        return FailureLog(
+            logged_date = date.today().isoformat(),
+            group       = sheet_tab,
+            is_primary  = primary_str,
+            hotel       = hotel_name,
+            check_in    = check_in,
+            check_out   = check_out,
+            day_type    = day_type,
+            reason      = reason,
+            search_url  = search_url,
+        )
 
     print(f"  🔍  [{label}] {hotel_name}  |  {check_in}  |  {currency}")
     try:
-        hotel_url = await get_hotel_url(
+        hotel_url, search_url = await get_hotel_url(
             page, hotel_name, check_in, check_out, currency, adults, rooms
         )
         if not hotel_url:
-            print(f"    ⚠️  No result found")
-            return None
+            print(f"    ⚠️  No search result found")
+            return None, make_failure("No search result", search_url)
 
         direct_url = (
             f"{hotel_url}?checkin={check_in}&checkout={check_out}"
@@ -330,7 +384,7 @@ async def fetch_hotel(page, hotel_name, currency, is_primary,
         room_list = await scrape_room_table(page)
         if not room_list:
             print(f"    ⚠️  Room table empty")
-            return None
+            return None, make_failure("Room table empty — hotel page loaded but no rooms shown", direct_url)
 
         cheapest  = room_list[0]
         total     = cheapest["total_val"]
@@ -340,11 +394,11 @@ async def fetch_hotel(page, hotel_name, currency, is_primary,
         return RoomResult(
             scraped_date       = date.today().isoformat(),
             group              = sheet_tab,
-            is_primary         = "Primary" if is_primary else "Compset",
+            is_primary         = primary_str,
             hotel              = hotel_name,
             check_in           = check_in,
             check_out          = check_out,
-            day_type           = classify_day_type(check_in),
+            day_type           = day_type,
             nights             = nights,
             room_type          = cheapest["room_type"],
             price_per_night    = f"{per_night:.0f}",
@@ -353,10 +407,11 @@ async def fetch_hotel(page, hotel_name, currency, is_primary,
             free_cancellation  = cheapest["free_cancellation"],
             breakfast_included = cheapest["breakfast"],
             url                = direct_url,
-        )
+        ), None
+
     except Exception as e:
-        print(f"    ❌  Error: {e}")
-        return None
+        print(f"    ❌  Exception: {e}")
+        return None, make_failure(f"Exception: {str(e)[:120]}", "")
 
 
 # ── Main ──────────────────────────────────────────────────
@@ -378,7 +433,8 @@ async def main():
     total  = len(hotels) * len(date_ranges)
     print(f"    {len(hotels)} hotels × {len(date_ranges)} dates = {total} combinations\n")
 
-    results: list[RoomResult] = []
+    results:  list[RoomResult]  = []
+    failures: list[FailureLog]  = []
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
@@ -396,7 +452,7 @@ async def main():
 
         for hotel in hotels:
             for check_in, check_out in date_ranges:
-                result = await fetch_hotel(
+                result, failure = await fetch_hotel(
                     page,
                     hotel["name"],
                     hotel["currency"],
@@ -409,16 +465,15 @@ async def main():
                 )
                 if result:
                     results.append(result)
+                if failure:
+                    failures.append(failure)
                 await asyncio.sleep(3)
 
         await browser.close()
 
-    if not results:
-        print("\n⚠️  No results scraped.")
-        sys.exit(0)
-
-    print(f"\n💾  Writing {len(results)} rows…")
-    append_results(spreadsheet, results, sheet_tab)
+    total_attempted = len(results) + len(failures)
+    print(f"\n💾  {len(results)} succeeded / {len(failures)} failed out of {total_attempted}")
+    append_results(spreadsheet, results, failures, sheet_tab)
     print(f"✅  Group '{GROUP_ID}' done.")
 
 
