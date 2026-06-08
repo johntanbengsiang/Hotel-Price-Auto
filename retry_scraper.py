@@ -154,7 +154,7 @@ def get_or_create_tab(spreadsheet, tab_name: str, headers: list[str]):
     try:
         ws = spreadsheet.worksheet(tab_name)
     except gspread.exceptions.WorksheetNotFound:
-        ws = spreadsheet.add_worksheet(title=tab_name, rows=100000, cols=25)
+        ws = spreadsheet.add_worksheet(title=tab_name, rows=5000, cols=20)
 
     if not ws.row_values(1):
         ws.append_row(headers, value_input_option="RAW")
